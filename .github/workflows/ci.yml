@@ -1,6 +1,7 @@
 name: CI
 
-on: [push, pull_request]
+on:
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -13,13 +14,14 @@ jobs:
   prepare-yarn-cache:
     name: Prepare Cache
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
       - name: Use Node.js latest
         uses: actions/setup-node@v4
         with:
-          node-version: latest
+          node-version: 25.5.0 # `latest` at the 7.29.0 release date; Node 26's require(ESM) change breaks mocha's bundled yargs
           check-latest: true
           cache: "yarn"
       - name: 'Check or update Yarn cache (fix w/ "yarn install")'
@@ -34,13 +36,14 @@ jobs:
     name: Validate Yarn dependencies and constraints
     needs: prepare-yarn-cache
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
       - name: Use Node.js latest
         uses: actions/setup-node@v4
         with:
-          node-version: latest
+          node-version: 25.5.0 # `latest` at the 7.29.0 release date; Node 26's require(ESM) change breaks mocha's bundled yargs
           check-latest: true
           cache: "yarn"
       - name: 'Check for unmet constraints (fix w/ "yarn constraints --fix")'
@@ -63,10 +66,14 @@ jobs:
     name: Test ESM version
     needs: prepare-yarn-cache
     runs-on: ubuntu-latest
+    timeout-minutes: 40
     strategy:
       fail-fast: false
       matrix:
-        node-version: [latest, 24, 22]
+        # `latest` was Node.js 25 when 7.29.0 was released. It now resolves to
+        # Node.js 26, whose require(ESM) change makes mocha's bundled
+        # `yargs/yargs` load as ESM under `USE_ESM` and throw.
+        node-version: [25.5.0, 24, 22]
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -90,6 +97,7 @@ jobs:
     name: Build Babel Artifacts
     needs: prepare-yarn-cache
     runs-on: ubuntu-latest
+    timeout-minutes: 40
     # Yarn PnP does not support native ESM yet (https://github.com/yarnpkg/berry/issues/638)
     # env:
     #    YARN_NODE_LINKER: pnp # use pnp linker for better linking performance and stricter checks
@@ -99,7 +107,7 @@ jobs:
       - name: Use Node.js latest
         uses: actions/setup-node@v4
         with:
-          node-version: latest
+          node-version: 25.5.0 # `latest` at the 7.29.0 release date; Node 26's require(ESM) change breaks mocha's bundled yargs
           check-latest: true
           cache: "yarn"
       - name: Build babel artifacts
@@ -110,8 +118,17 @@ jobs:
           BABEL_8_BREAKING: false
           STRIP_BABEL_8_FLAG: true
       - name: Build Makefile.js
+        # `--auto` skips the rebuild while the committed bundle's embedded
+        # source hash is current. Regenerating it unconditionally no longer
+        # reproduces the committed Makefile.mjs: the bundle inlines
+        # @babel/preset-env output for the browserslist query "maintained node
+        # versions" (scripts/pack-script.js), which is resolved against the
+        # current date, so Node.js 20 ageing out since the release emits a
+        # legitimately different bundle and trips assert-dir-git-clean below.
+        # A real change to Makefile.source.mjs still rebuilds and is still
+        # asserted.
         run: |
-          node ./scripts/pack-script.js
+          node ./scripts/pack-script.js --auto
       - name: Generate readmes
         run: |
           make generate-readme
@@ -124,24 +141,78 @@ jobs:
       - name: Ensure cwd does not contain uncommitted changes
         run: |
           node ./scripts/assert-dir-git-clean.js "\`make build\` and \`node scripts/cleanup-fixtures.js\`"
+      # Bundle the hand-off to the test jobs as a single tar: this artifact is
+      # an internal build->test hand-off, and shipping it as thousands of loose
+      # files makes the collected artifact set ambiguous.
+      - name: Bundle build output for the test jobs
+        shell: bash
+        run: |
+          shopt -s globstar nullglob
+          printf '%s\0' \
+            codemods/*/lib/**/* \
+            eslint/*/lib/**/* \
+            packages/*/lib/**/* \
+            packages/babel-standalone/*.js \
+            packages/babel-runtime/**/*.js \
+            packages/babel-runtime-corejs2/**/*.js \
+            packages/babel-runtime-corejs3/**/*.js \
+            packages/babel-core/src/vendor/* \
+            | grep -zv '/node_modules/' > /tmp/babel-artifact-files
+          tar --null --no-recursion -cf /tmp/babel-artifact.tar -T /tmp/babel-artifact-files
       - uses: actions/upload-artifact@v4
         with:
           name: babel-artifact
-          path: |
-            codemods/*/lib/**/*
-            eslint/*/lib/**/*
-            packages/*/lib/**/*
-            packages/babel-standalone/*.js
-            packages/babel-runtime/**/*.js
-            packages/babel-runtime-corejs2/**/*.js
-            packages/babel-runtime-corejs3/**/*.js
-            packages/babel-core/src/vendor/*
-            !**/node_modules/**
+          path: /tmp/babel-artifact.tar
+          if-no-files-found: error
+          retention-days: 5
+
+  pack-npm-artifact:
+    name: Pack npm release tarballs
+    needs: prepare-yarn-cache
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      - name: Use Node.js latest
+        uses: actions/setup-node@v4
+        with:
+          node-version: 25.5.0 # `latest` at the 7.29.0 release date; Node 26's require(ESM) change breaks mocha's bundled yargs
+          check-latest: true
+          cache: "yarn"
+      - name: Install
+        run: yarn install
+      # Reproduce the publish-time build from the `npm-release` job of
+      # release.yml (`make prepublish` minus its test run, which the other
+      # jobs of this workflow already cover).
+      - name: Set module type
+        run: node ./scripts/set-module-type.js commonjs
+      - name: Build publishable artifacts
+        run: make prepublish-build
+        env:
+          IS_PUBLISH: "true"
+          BABEL_8_BREAKING: ""
+          FORCE_COLOR: true
+      # `make prepublish` ends with this, and release.yml only runs
+      # `release-tool publish` afterwards — so the published tarballs are packed
+      # with the per-package `lib/package.json` markers removed again.
+      - name: Clean module type
+        run: node ./scripts/set-module-type.js clean
+      - name: Pack @babel/core
+        run: |
+          mkdir -p /tmp/npm-tarballs
+          yarn workspace @babel/core pack --out /tmp/npm-tarballs/core-%v.tgz
+      - uses: actions/upload-artifact@v4
+        with:
+          name: npm-tarballs
+          path: /tmp/npm-tarballs/*.tgz
+          if-no-files-found: error
           retention-days: 5
 
   build-windows:
     name: Build Babel Artifacts on Windows
     runs-on: windows-latest
+    timeout-minutes: 60
     # Yarn PnP does not support native ESM yet (https://github.com/yarnpkg/berry/issues/638)
     # env:
     #    YARN_NODE_LINKER: pnp # use pnp linker for better linking performance and stricter checks
@@ -151,7 +222,7 @@ jobs:
       - name: Use Node.js latest
         uses: actions/setup-node@v4
         with:
-          node-version: latest
+          node-version: 25.5.0 # `latest` at the 7.29.0 release date; Node 26's require(ESM) change breaks mocha's bundled yargs
           check-latest: true
           cache: "yarn"
       - name: Build babel artifacts
@@ -170,13 +241,14 @@ jobs:
     name: Lint
     needs: build
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
       - name: Use Node.js latest
         uses: actions/setup-node@v4
         with:
-          node-version: latest
+          node-version: 25.5.0 # `latest` at the 7.29.0 release date; Node 26's require(ESM) change breaks mocha's bundled yargs
           check-latest: true
           cache: "yarn"
       - name: Install
@@ -184,6 +256,11 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           name: babel-artifact
+      - name: Unpack build output
+        shell: bash
+        run: |
+          tar -xf babel-artifact.tar
+          rm babel-artifact.tar
       - name: Lint
         run: make -j lint-ci check-compat-data
       - name: Ensure cwd does not contain uncommitted changes
@@ -194,13 +271,14 @@ jobs:
     name: Test on Node.js Latest (with coverage)
     needs: build
     runs-on: ubuntu-latest
+    timeout-minutes: 50
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
       - name: Use Node.js latest
         uses: actions/setup-node@v4
         with:
-          node-version: latest
+          node-version: 25.5.0 # `latest` at the 7.29.0 release date; Node 26's require(ESM) change breaks mocha's bundled yargs
           check-latest: true
           cache: "yarn"
       - name: Install
@@ -209,6 +287,11 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           name: babel-artifact
+      - name: Unpack build output
+        shell: bash
+        run: |
+          tar -xf babel-artifact.tar
+          rm babel-artifact.tar
       - name: Run tests
         run: |
           yarn c8 jest --ci
@@ -216,27 +299,28 @@ jobs:
         env:
           BABEL_ENV: test
           BABEL_COVERAGE: true
-      - name: Upload coverage report
-        uses: codecov/codecov-action@v5
-        with:
-          token: ${{ secrets.CODECOV_TOKEN }}
-          name: babel-7
 
   test:
     name: Test on Node.js ${{matrix.node-version}}
     needs: build
     runs-on: ubuntu-latest
+    timeout-minutes: 50
     strategy:
       fail-fast: false
       matrix:
-        node-version: [24, 22, 20, 18, 16, 14, 12, 10, 8, 6]
+        # 24 is pinned to the patch current at the 7.29.0 release date: 24.19
+        # added --test-random-seed and --experimental-test-tag-filter, so the
+        # "node flags are up to date" step below fails against it. The other
+        # majors are already at their final patch, and none of them is pinned
+        # so the `matrix.node-version == '6'` comparisons below still match.
+        node-version: [24.13.0, 22, 20, 18, 16, 14, 12, 10, 8, 6]
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
       - name: Use Node.js latest # Run yarn on latest node
         uses: actions/setup-node@v4
         with:
-          node-version: latest
+          node-version: 25.5.0 # `latest` at the 7.29.0 release date; Node 26's require(ESM) change breaks mocha's bundled yargs
           check-latest: true
           cache: "yarn"
       - name: Install
@@ -244,6 +328,14 @@ jobs:
           yarn install
       - name: Downgrade Jest and Babel for node <= 10
         if: matrix.node-version == '6' || matrix.node-version == '8' || matrix.node-version == '10'
+        # `bump-babel-dependencies.js` pins the root `@babel/*` deps to the
+        # `latest` dist-tag, which meant Babel 7 at the 7.29.0 release date but
+        # now resolves to Babel 8 (ESM) and breaks jest@24 on these legs. Pin
+        # the registry to the release date so `latest` means what it did then.
+        env:
+          YARN_NPM_REGISTRY_SERVER: https://time-machines-npm.sealsecurity.io/
+          YARN_NPM_AUTH_TOKEN: "2026-01-31T17:39:22.681Z"
+          YARN_NPM_ALWAYS_AUTH: "true"
         run: |
           # It's a bit sarcastic that in this scenario bump-babel-dependencies.js
           # actually downgrades the root `@babel/*` deps from 8.0 alpha to 7
@@ -274,6 +366,11 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           name: babel-artifact
+      - name: Unpack build output
+        shell: bash
+        run: |
+          tar -xf babel-artifact.tar
+          rm babel-artifact.tar
       - name: Use Node.js ${{ matrix.node-version }} # Checkout node version for test executor
         uses: actions/setup-node@v4
         with:
@@ -292,7 +389,7 @@ jobs:
         if: matrix.node-version == '6' || matrix.node-version == '8' || matrix.node-version == '10'
         uses: actions/setup-node@v4
         with:
-          node-version: latest
+          node-version: 25.5.0 # `latest` at the 7.29.0 release date; Node 26's require(ESM) change breaks mocha's bundled yargs
 
   test-windows-mac:
     name: Test on
@@ -302,13 +399,14 @@ jobs:
       matrix:
         os: [windows-latest, macos-latest]
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
       - name: Use Node.js latest
         uses: actions/setup-node@v4
         with:
-          node-version: latest
+          node-version: 25.5.0 # `latest` at the 7.29.0 release date; Node 26's require(ESM) change breaks mocha's bundled yargs
           check-latest: true
           cache: "yarn"
       - name: Install
@@ -316,6 +414,11 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           name: babel-artifact
+      - name: Unpack build output
+        shell: bash
+        run: |
+          tar -xf babel-artifact.tar
+          rm babel-artifact.tar
       - name: Test
         run: yarn jest --ci
         env:
@@ -325,13 +428,14 @@ jobs:
     name: Third-party Parser Tests
     needs: build
     runs-on: ubuntu-latest
+    timeout-minutes: 50
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
       - name: Use Node.js latest
         uses: actions/setup-node@v4
         with:
-          node-version: latest
+          node-version: 25.5.0 # `latest` at the 7.29.0 release date; Node 26's require(ESM) change breaks mocha's bundled yargs
           check-latest: true
           cache: "yarn"
       - name: Install
@@ -339,6 +443,11 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           name: babel-artifact
+      - name: Unpack build output
+        shell: bash
+        run: |
+          tar -xf babel-artifact.tar
+          rm babel-artifact.tar
       - name: Download tests
         run: make -j bootstrap-flow bootstrap-typescript bootstrap-test262
       - name: Run Test262 Tests
@@ -352,13 +461,14 @@ jobs:
     name: Prepare runtime integration tests
     needs: build
     runs-on: ubuntu-latest
+    timeout-minutes: 40
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
       - name: Use Node.js latest
         uses: actions/setup-node@v4
         with:
-          node-version: latest
+          node-version: 25.5.0 # `latest` at the 7.29.0 release date; Node 26's require(ESM) change breaks mocha's bundled yargs
           check-latest: true
           cache: "yarn"
       # See https://github.com/babel/babel/pull/12906
@@ -386,6 +496,11 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           name: babel-artifact
+      - name: Unpack build output
+        shell: bash
+        run: |
+          tar -xf babel-artifact.tar
+          rm babel-artifact.tar
       - name: Generate absoluteRuntime tests
         run: yarn test:runtime:generate-absolute-runtime
       - name: Test bundlers
@@ -397,6 +512,7 @@ jobs:
     name: Test @babel/runtime integrations on Node.js
     needs: [build, runtime-interop-prepare]
     runs-on: ubuntu-latest
+    timeout-minutes: 40
     strategy:
       fail-fast: false
       matrix:
@@ -425,7 +541,7 @@ jobs:
       - name: Use Node.js latest
         uses: actions/setup-node@v4
         with:
-          node-version: latest
+          node-version: 25.5.0 # `latest` at the 7.29.0 release date; Node 26's require(ESM) change breaks mocha's bundled yargs
           check-latest: true
           cache: "yarn"
       # See https://github.com/babel/babel/pull/12906
@@ -453,6 +569,11 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           name: babel-artifact
+      - name: Unpack build output
+        shell: bash
+        run: |
+          tar -xf babel-artifact.tar
+          rm babel-artifact.tar
       - name: Generate absoluteRuntime tests
         run: yarn test:runtime:generate-absolute-runtime
       - name: Use Node.js ${{ matrix.node-version }}
@@ -466,13 +587,14 @@ jobs:
     name: Test @babel/eslint-* with ESLint 7.5.0
     needs: build
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
       - name: Use Node.js latest
         uses: actions/setup-node@v4
         with:
-          node-version: latest
+          node-version: 25.5.0 # `latest` at the 7.29.0 release date; Node 26's require(ESM) change breaks mocha's bundled yargs
           check-latest: true
           cache: "yarn"
       - name: Install
@@ -480,6 +602,11 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           name: babel-artifact
+      - name: Unpack build output
+        shell: bash
+        run: |
+          tar -xf babel-artifact.tar
+          rm babel-artifact.tar
       - name: Downgrade ESLint to 7.5.0
         run: yarn up eslint@7.5.0
       - name: Run babel/eslint tests
@@ -489,13 +616,14 @@ jobs:
     name: Test @babel/eslint-* with ESLint 8.0.0
     needs: build
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
       - name: Use Node.js latest
         uses: actions/setup-node@v4
         with:
-          node-version: latest
+          node-version: 25.5.0 # `latest` at the 7.29.0 release date; Node 26's require(ESM) change breaks mocha's bundled yargs
           check-latest: true
           cache: "yarn"
       - name: Install
@@ -503,6 +631,11 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           name: babel-artifact
+      - name: Unpack build output
+        shell: bash
+        run: |
+          tar -xf babel-artifact.tar
+          rm babel-artifact.tar
       - name: Downgrade ESLint to 8.0.0
         run: yarn up eslint@8.0.0
       - name: Run babel/eslint tests
@@ -511,6 +644,7 @@ jobs:
   test262-prepare:
     name: test262 - Prepare for running in parallel
     runs-on: ubuntu-latest
+    timeout-minutes: 40
     if: github.repository == 'babel/babel'
     steps:
       - name: Checkout Babel
@@ -518,7 +652,7 @@ jobs:
       - name: Use Node.js latest
         uses: actions/setup-node@v4
         with:
-          node-version: latest
+          node-version: 25.5.0 # `latest` at the 7.29.0 release date; Node 26's require(ESM) change breaks mocha's bundled yargs
           check-latest: true
       - name: Checkout test runner
         uses: actions/checkout@v4
@@ -548,6 +682,7 @@ jobs:
       matrix:
         chunk: [0, 1, 2, 3, 4, 5, 6, 7]
     runs-on: ubuntu-latest
+    timeout-minutes: 50
     needs: [build, test262-prepare]
     steps:
       - name: Checkout Babel
@@ -555,13 +690,18 @@ jobs:
       - name: Use Node.js latest
         uses: actions/setup-node@v4
         with:
-          node-version: latest
+          node-version: 25.5.0 # `latest` at the 7.29.0 release date; Node 26's require(ESM) change breaks mocha's bundled yargs
           check-latest: true
       - name: Install
         run: yarn install
       - uses: actions/download-artifact@v4
         with:
           name: babel-artifact
+      - name: Unpack build output
+        shell: bash
+        run: |
+          tar -xf babel-artifact.tar
+          rm babel-artifact.tar
       - name: Checkout test runner
         uses: actions/checkout@v4
         with:
@@ -602,6 +742,7 @@ jobs:
   test262-finish:
     name: test262 - Analyze results
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     needs: test262
     steps:
       - uses: actions/download-artifact@v4

@@ -1,6 +1,7 @@
 name: REPL
 
-on: [pull_request_target]
+on:
+  workflow_dispatch:
 
 permissions:
   contents: read

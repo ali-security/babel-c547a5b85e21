@@ -1,7 +1,6 @@
 name: Open issue to remind doing something
 on:
-  schedule:
-    - cron: 0 0 15 07 *
+  workflow_dispatch:
 
 permissions:
   issues: write

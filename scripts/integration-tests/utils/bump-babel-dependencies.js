@@ -28,11 +28,15 @@ if (process.argv[2] === "resolutions") {
   if ("peerDependencies" in content) {
     bumpBabelDependency("peerDependencies", "*");
   }
+  // `latest` meant the Babel 7 line when this was written, which is the point
+  // of the "downgrade" callers (CI's node <= 10 legs, which pin jest@24).
+  // Babel 8 has since taken over the `latest` dist-tag and ships ESM, which
+  // that toolchain cannot load, so ask for the 7 line explicitly.
   if ("devDependencies" in content) {
-    bumpBabelDependency("devDependencies", "latest");
+    bumpBabelDependency("devDependencies", "^7");
   }
   if ("dependencies" in content) {
-    bumpBabelDependency("dependencies", "latest");
+    bumpBabelDependency("dependencies", "^7");
   }
 }
 
